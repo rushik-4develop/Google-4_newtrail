@@ -1,0 +1,526 @@
+name: AWS Security and Compliance
+
+on:
+  schedule:
+    # Run security scans daily at 1 AM UTC
+    - cron: '0 1 * * *'
+    # Run compliance checks weekly on Mondays at 2 AM UTC
+    - cron: '0 2 * * 1'
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'src/**'
+      - 'infrastructure/**'
+      - '.github/workflows/aws-security-compliance.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'src/**'
+      - 'infrastructure/**'
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Type of security scan to run'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - vulnerability
+          - compliance
+          - secrets
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  vulnerability-scanning:
+    name: Vulnerability Scanning
+    if: github.event.schedule == '0 1 * * *' || github.event.inputs.scan_type == 'full' || github.event.inputs.scan_type == 'vulnerability' || github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+
+      - name: Run Trivy Configuration Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-config-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+
+      - name: Upload Trivy config scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-config-results.sarif'
+
+      - name: Scan ECR Images
+        run: |
+          # Get ECR repository URI
+          ECR_REPO=$(aws ecr describe-repositories \
+            --repository-names bookstore-app \
+            --query 'repositories[0].repositoryUri' \
+            --output text 2>/dev/null || echo "not-found")
+          
+          if [ "$ECR_REPO" != "not-found" ]; then
+            # Get latest image
+            LATEST_IMAGE=$(aws ecr describe-images \
+              --repository-name bookstore-app \
+              --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' \
+              --output text 2>/dev/null || echo "not-found")
+            
+            if [ "$LATEST_IMAGE" != "not-found" ] && [ "$LATEST_IMAGE" != "null" ]; then
+              echo "Scanning ECR image: $ECR_REPO:$LATEST_IMAGE"
+              
+              # Run Trivy scan on ECR image
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                aquasec/trivy image --format json --output ecr-scan-results.json \
+                $ECR_REPO:$LATEST_IMAGE || true
+              
+              # Check for high/critical vulnerabilities
+              HIGH_VULNS=$(cat ecr-scan-results.json 2>/dev/null | jq '.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH" or .Severity == "CRITICAL")' | jq -s length || echo "0")
+              
+              echo "Found $HIGH_VULNS high/critical vulnerabilities in ECR image"
+              
+              if [ "$HIGH_VULNS" -gt 0 ]; then
+                aws sns publish \
+                  --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-security-alerts \
+                  --message "🚨 SECURITY ALERT: Found $HIGH_VULNS high/critical vulnerabilities in ECR image $ECR_REPO:$LATEST_IMAGE" \
+                  --subject "Bookstore ECR Image Vulnerabilities"
+              fi
+            fi
+          fi
+
+      - name: AWS Inspector Assessment
+        run: |
+          # Check if Inspector is enabled and run assessment
+          ASSESSMENT_TARGET=$(aws inspector list-assessment-targets \
+            --query 'assessmentTargetArns[0]' \
+            --output text 2>/dev/null || echo "not-found")
+          
+          if [ "$ASSESSMENT_TARGET" != "not-found" ] && [ "$ASSESSMENT_TARGET" != "None" ]; then
+            # Get assessment template
+            ASSESSMENT_TEMPLATE=$(aws inspector list-assessment-templates \
+              --assessment-target-arns $ASSESSMENT_TARGET \
+              --query 'assessmentTemplateArns[0]' \
+              --output text 2>/dev/null || echo "not-found")
+            
+            if [ "$ASSESSMENT_TEMPLATE" != "not-found" ] && [ "$ASSESSMENT_TEMPLATE" != "None" ]; then
+              # Start assessment run
+              ASSESSMENT_RUN=$(aws inspector start-assessment-run \
+                --assessment-template-arn $ASSESSMENT_TEMPLATE \
+                --assessment-run-name "bookstore-security-scan-$(date +%Y%m%d%H%M%S)" \
+                --query 'assessmentRunArn' \
+                --output text)
+              
+              echo "Started Inspector assessment run: $ASSESSMENT_RUN"
+            fi
+          else
+            echo "AWS Inspector not configured - skipping assessment"
+          fi
+
+  secrets-scanning:
+    name: Secrets Scanning
+    if: github.event.inputs.scan_type == 'full' || github.event.inputs.scan_type == 'secrets' || github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for secret scanning
+
+      - name: Run GitLeaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      - name: Run TruffleHog Secret Scan
+        run: |
+          # Install TruffleHog
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+          
+          # Scan repository for secrets
+          trufflehog git file://. --json > trufflehog-results.json || true
+          
+          # Check if any secrets were found
+          SECRETS_FOUND=$(cat trufflehog-results.json | jq length)
+          echo "TruffleHog found $SECRETS_FOUND potential secrets"
+          
+          if [ "$SECRETS_FOUND" -gt 0 ]; then
+            echo "⚠️ Potential secrets detected in repository"
+            echo "secrets-found=true" >> $GITHUB_ENV
+          else
+            echo "✅ No secrets detected"
+            echo "secrets-found=false" >> $GITHUB_ENV
+          fi
+
+      - name: Check AWS Secrets Manager
+        run: |
+          # Check for unused secrets
+          SECRETS=$(aws secretsmanager list-secrets \
+            --query 'SecretList[?contains(Name, `bookstore`)].Name' \
+            --output text)
+          
+          echo "Found bookstore secrets in AWS Secrets Manager:"
+          for secret in $SECRETS; do
+            echo "- $secret"
+            
+            # Check last accessed date
+            LAST_ACCESSED=$(aws secretsmanager describe-secret \
+              --secret-id $secret \
+              --query 'LastAccessedDate' \
+              --output text 2>/dev/null || echo "never")
+            
+            echo "  Last accessed: $LAST_ACCESSED"
+          done
+
+      - name: Alert on Secrets Found
+        if: env.secrets-found == 'true'
+        run: |
+          aws sns publish \
+            --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-security-alerts \
+            --message "🔐 SECURITY ALERT: Potential secrets detected in repository. Please review and rotate if necessary." \
+            --subject "Bookstore Secrets Detection Alert"
+
+  compliance-checking:
+    name: Compliance Checking
+    if: github.event.schedule == '0 2 * * 1' || github.event.inputs.scan_type == 'full' || github.event.inputs.scan_type == 'compliance'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: AWS Config Compliance Check
+        run: |
+          # Check AWS Config rules compliance
+          COMPLIANCE_SUMMARY=$(aws configservice get-compliance-summary-by-config-rule \
+            --query 'ComplianceSummary' \
+            --output json 2>/dev/null || echo '{"ComplianceByConfigRule":{"COMPLIANT":0,"NON_COMPLIANT":0}}')
+          
+          COMPLIANT=$(echo $COMPLIANCE_SUMMARY | jq '.ComplianceByConfigRule.COMPLIANT // 0')
+          NON_COMPLIANT=$(echo $COMPLIANCE_SUMMARY | jq '.ComplianceByConfigRule.NON_COMPLIANT // 0')
+          
+          echo "AWS Config Compliance Summary:"
+          echo "- Compliant rules: $COMPLIANT"
+          echo "- Non-compliant rules: $NON_COMPLIANT"
+          
+          if [ "$NON_COMPLIANT" -gt 0 ]; then
+            # Get details of non-compliant rules
+            aws configservice get-compliance-details-by-config-rule \
+              --compliance-types NON_COMPLIANT \
+              --query 'EvaluationResults[].{Rule:ConfigRuleName,Resource:EvaluationResultIdentifier.EvaluationResultQualifier.ResourceId}' \
+              --output table
+            
+            aws sns publish \
+              --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-security-alerts \
+              --message "⚠️ COMPLIANCE ALERT: $NON_COMPLIANT AWS Config rules are non-compliant" \
+              --subject "Bookstore Compliance Alert"
+          fi
+
+      - name: Security Group Audit
+        run: |
+          echo "## Security Group Audit" >> compliance-report.md
+          
+          # Check for overly permissive security groups
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=*bookstore*" \
+            --query 'SecurityGroups[].GroupId' \
+            --output text)
+          
+          for sg_id in $SG_IDS; do
+            echo "Checking security group: $sg_id"
+            
+            # Check for 0.0.0.0/0 access
+            OPEN_ACCESS=$(aws ec2 describe-security-groups \
+              --group-ids $sg_id \
+              --query 'SecurityGroups[].IpPermissions[?IpRanges[?CidrIp==`0.0.0.0/0`]]' \
+              --output json)
+            
+            if [ "$OPEN_ACCESS" != "[]" ] && [ "$OPEN_ACCESS" != "null" ]; then
+              echo "⚠️ Warning: Security group $sg_id has open access (0.0.0.0/0)"
+              echo "- **$sg_id**: Open access detected" >> compliance-report.md
+            else
+              echo "✅ Security group $sg_id follows least privilege principle"
+              echo "- **$sg_id**: Compliant" >> compliance-report.md
+            fi
+          done
+
+      - name: IAM Policy Review
+        run: |
+          echo "## IAM Policy Review" >> compliance-report.md
+          
+          # Check for overly broad IAM policies
+          POLICIES=$(aws iam list-policies \
+            --scope Local \
+            --query 'Policies[?contains(PolicyName, `bookstore`)].Arn' \
+            --output text)
+          
+          for policy_arn in $POLICIES; do
+            echo "Reviewing policy: $policy_arn"
+            
+            # Get policy version
+            VERSION_ID=$(aws iam get-policy \
+              --policy-arn $policy_arn \
+              --query 'Policy.DefaultVersionId' \
+              --output text)
+            
+            # Check for admin access
+            ADMIN_ACCESS=$(aws iam get-policy-version \
+              --policy-arn $policy_arn \
+              --version-id $VERSION_ID \
+              --query 'PolicyVersion.Document.Statement[?Effect==`Allow` && Action==`*` && Resource==`*`]' \
+              --output text)
+            
+            if [ "$ADMIN_ACCESS" != "None" ] && [ "$ADMIN_ACCESS" != "" ]; then
+              echo "⚠️ Warning: Policy $policy_arn grants admin access"
+              echo "- **$(basename $policy_arn)**: Admin access detected" >> compliance-report.md
+            else
+              echo "✅ Policy $policy_arn follows least privilege principle"
+              echo "- **$(basename $policy_arn)**: Compliant" >> compliance-report.md
+            fi
+          done
+
+      - name: Encryption at Rest Check
+        run: |
+          echo "## Encryption at Rest Check" >> compliance-report.md
+          
+          # Check RDS encryption
+          RDS_INSTANCES=$(aws rds describe-db-instances \
+            --query 'DBInstances[?contains(DBInstanceIdentifier, `bookstore`)].{ID:DBInstanceIdentifier,Encrypted:StorageEncrypted}' \
+            --output json)
+          
+          echo "RDS Encryption Status:"
+          echo "$RDS_INSTANCES" | jq -r '.[] | "- \(.ID): \(if .Encrypted then "✅ Encrypted" else "❌ Not Encrypted" end)"'
+          echo "$RDS_INSTANCES" | jq -r '.[] | "- **\(.ID)**: \(if .Encrypted then "Encrypted" else "Not Encrypted" end)"' >> compliance-report.md
+          
+          # Check S3 encryption
+          S3_BUCKETS=$(aws s3api list-buckets \
+            --query 'Buckets[?contains(Name, `bookstore`)].Name' \
+            --output text)
+          
+          echo "S3 Encryption Status:" >> compliance-report.md
+          for bucket in $S3_BUCKETS; do
+            ENCRYPTION=$(aws s3api get-bucket-encryption \
+              --bucket $bucket \
+              --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
+              --output text 2>/dev/null || echo "not-encrypted")
+            
+            if [ "$ENCRYPTION" != "not-encrypted" ]; then
+              echo "- **$bucket**: Encrypted ($ENCRYPTION)" >> compliance-report.md
+            else
+              echo "- **$bucket**: Not Encrypted" >> compliance-report.md
+            fi
+          done
+
+      - name: CloudTrail Audit
+        run: |
+          echo "## CloudTrail Audit" >> compliance-report.md
+          
+          # Check if CloudTrail is enabled
+          TRAILS=$(aws cloudtrail describe-trails \
+            --query 'trailList[?contains(Name, `bookstore`)].{Name:Name,IsLogging:IsLogging}' \
+            --output json)
+          
+          if [ "$TRAILS" != "[]" ]; then
+            echo "$TRAILS" | jq -r '.[] | "- **\(.Name)**: \(if .IsLogging then "Active" else "Inactive" end)"' >> compliance-report.md
+          else
+            echo "- **No CloudTrail**: Not configured" >> compliance-report.md
+          fi
+
+      - name: Upload Compliance Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-report
+          path: compliance-report.md
+
+      - name: Generate Compliance Summary
+        run: |
+          echo "## 📋 Compliance Check Summary" >> $GITHUB_STEP_SUMMARY
+          echo "### Date: $(date)" >> $GITHUB_STEP_SUMMARY
+          cat compliance-report.md >> $GITHUB_STEP_SUMMARY
+
+  penetration-testing:
+    name: Automated Penetration Testing
+    if: github.event.schedule == '0 2 * * 1' || github.event.inputs.scan_type == 'full'
+    runs-on: ubuntu-latest
+    environment: security-testing
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Security Testing Tools
+        run: |
+          # Install OWASP ZAP
+          sudo apt-get update
+          sudo apt-get install -y default-jre wget
+          wget https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2.14.0_Linux.tar.gz
+          tar -xzf ZAP_2.14.0_Linux.tar.gz
+          chmod +x ZAP_2.14.0/zap.sh
+
+      - name: Get Application URL
+        id: app-url
+        run: |
+          # Get the load balancer URL
+          LB_URL=$(aws elbv2 describe-load-balancers \
+            --names bookstore-alb-production \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text 2>/dev/null || echo "not-found")
+          
+          if [ "$LB_URL" != "not-found" ]; then
+            echo "app-url=http://$LB_URL" >> $GITHUB_OUTPUT
+          else
+            echo "Application load balancer not found"
+            exit 1
+          fi
+
+      - name: Run OWASP ZAP Security Scan
+        if: steps.app-url.outputs.app-url != ''
+        run: |
+          APP_URL="${{ steps.app-url.outputs.app-url }}"
+          
+          # Run ZAP baseline scan
+          ./ZAP_2.14.0/zap.sh -cmd -quickurl $APP_URL -quickprogress -quickout zap-report.html
+          
+          # Run spider scan
+          ./ZAP_2.14.0/zap.sh -cmd -quickurl $APP_URL -quickout zap-spider-report.json -quickprogress
+          
+          echo "OWASP ZAP scan completed"
+
+      - name: Parse Security Scan Results
+        run: |
+          # Check if high/medium risk issues were found
+          if [ -f "zap-report.html" ]; then
+            HIGH_RISKS=$(grep -c "High\|Medium" zap-report.html || echo "0")
+            echo "Found $HIGH_RISKS high/medium risk security issues"
+            
+            if [ "$HIGH_RISKS" -gt 0 ]; then
+              aws sns publish \
+                --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-security-alerts \
+                --message "🔍 PENTEST ALERT: Found $HIGH_RISKS high/medium risk security issues in penetration test" \
+                --subject "Bookstore Penetration Test Results"
+            fi
+          fi
+
+      - name: Upload Security Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: |
+            zap-report.html
+            zap-spider-report.json
+
+  security-monitoring-setup:
+    name: Security Monitoring Setup
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Enable GuardDuty
+        run: |
+          # Check if GuardDuty is enabled
+          DETECTOR_ID=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text 2>/dev/null || echo "none")
+          
+          if [ "$DETECTOR_ID" = "none" ] || [ "$DETECTOR_ID" = "null" ]; then
+            echo "Enabling GuardDuty..."
+            aws guardduty create-detector --enable
+          else
+            echo "GuardDuty is already enabled with detector ID: $DETECTOR_ID"
+          fi
+
+      - name: Enable Security Hub
+        run: |
+          # Check if Security Hub is enabled
+          SECURITY_HUB=$(aws securityhub get-enabled-standards --query 'StandardsSubscriptions[0].StandardsSubscriptionArn' --output text 2>/dev/null || echo "not-enabled")
+          
+          if [ "$SECURITY_HUB" = "not-enabled" ] || [ "$SECURITY_HUB" = "null" ]; then
+            echo "Enabling Security Hub..."
+            aws securityhub enable-security-hub --enable-default-standards || true
+          else
+            echo "Security Hub is already enabled"
+          fi
+
+      - name: Configure CloudWatch Security Alarms
+        run: |
+          # Create alarm for failed login attempts
+          aws cloudwatch put-metric-alarm \
+            --alarm-name "BookstoreFailedLogins" \
+            --alarm-description "Alert on multiple failed login attempts" \
+            --metric-name "ErrorCount" \
+            --namespace "AWS/ApplicationELB" \
+            --statistic Sum \
+            --period 300 \
+            --threshold 10 \
+            --comparison-operator GreaterThanThreshold \
+            --evaluation-periods 2 \
+            --alarm-actions "arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-security-alerts" || true
+
+  security-report:
+    name: Generate Security Report
+    runs-on: ubuntu-latest
+    needs: [vulnerability-scanning, secrets-scanning, compliance-checking]
+    if: always()
+    
+    steps:
+      - name: Generate Security Summary
+        run: |
+          echo "## 🔒 Security Assessment Report" >> $GITHUB_STEP_SUMMARY
+          echo "### Date: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "### Assessment Status:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Vulnerability Scanning**: ${{ needs.vulnerability-scanning.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Secrets Scanning**: ${{ needs.secrets-scanning.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Compliance Checking**: ${{ needs.compliance-checking.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Recommendations:" >> $GITHUB_STEP_SUMMARY
+          echo "- Review and remediate any high/critical vulnerabilities" >> $GITHUB_STEP_SUMMARY
+          echo "- Rotate any exposed secrets immediately" >> $GITHUB_STEP_SUMMARY
+          echo "- Address compliance violations" >> $GITHUB_STEP_SUMMARY
+          echo "- Schedule regular security assessments" >> $GITHUB_STEP_SUMMARY
+
+      - name: Send Security Report Notification
+        run: |
+          # This step would send a comprehensive security report
+          # Implementation depends on your notification preferences
+          echo "Security assessment completed. Check GitHub Actions summary for details."

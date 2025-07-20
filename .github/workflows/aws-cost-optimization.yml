@@ -1,0 +1,713 @@
+name: AWS Cost Optimization
+
+on:
+  schedule:
+    # Run cost analysis daily at 6 AM UTC
+    - cron: '0 6 * * *'
+    # Run resource cleanup weekly on Sundays at 5 AM UTC
+    - cron: '0 5 * * 0'
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'cost-optimization/**'
+      - '.github/workflows/aws-cost-optimization.yml'
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'Cost optimization operation'
+        required: true
+        default: 'analyze'
+        type: choice
+        options:
+          - analyze
+          - cleanup
+          - rightsizing
+          - reserved-instances
+      environment:
+        description: 'Environment to optimize'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - dev
+          - staging
+          - production
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  cost-analysis:
+    name: Cost Analysis and Reporting
+    if: github.event.schedule == '0 6 * * *' || github.event.inputs.operation == 'analyze' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install AWS CLI and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq bc
+
+      - name: Generate Daily Cost Report
+        run: |
+          echo "# AWS Cost Analysis Report" >> cost-report.md
+          echo "## Generated: $(date)" >> cost-report.md
+          echo "" >> cost-report.md
+          
+          # Get date range (last 7 days)
+          END_DATE=$(date +"%Y-%m-%d")
+          START_DATE=$(date -d '7 days ago' +"%Y-%m-%d")
+          
+          echo "### Cost Overview (Last 7 Days)" >> cost-report.md
+          echo "**Period**: $START_DATE to $END_DATE" >> cost-report.md
+          echo "" >> cost-report.md
+          
+          # Get total cost for the period
+          TOTAL_COST=$(aws ce get-cost-and-usage \
+            --time-period Start=$START_DATE,End=$END_DATE \
+            --granularity DAILY \
+            --metrics BlendedCost \
+            --query 'ResultsByTime[].Total.BlendedCost.Amount' \
+            --output text | awk '{sum += $1} END {print sum}')
+          
+          echo "**Total Cost**: \$$(printf "%.2f" $TOTAL_COST)" >> cost-report.md
+          echo "" >> cost-report.md
+
+      - name: Analyze Cost by Service
+        run: |
+          echo "### Cost by AWS Service" >> cost-report.md
+          
+          # Get date range
+          END_DATE=$(date +"%Y-%m-%d")
+          START_DATE=$(date -d '7 days ago' +"%Y-%m-%d")
+          
+          # Get cost by service
+          aws ce get-cost-and-usage \
+            --time-period Start=$START_DATE,End=$END_DATE \
+            --granularity DAILY \
+            --metrics BlendedCost \
+            --group-by Type=DIMENSION,Key=SERVICE \
+            --query 'ResultsByTime[0].Groups[].[Keys[0], Total.BlendedCost.Amount]' \
+            --output table >> service-costs.txt
+          
+          # Format for markdown
+          echo "| Service | Cost (USD) |" >> cost-report.md
+          echo "|---------|------------|" >> cost-report.md
+          
+          # Parse and sort by cost
+          tail -n +4 service-costs.txt | head -n -1 | while read line; do
+            SERVICE=$(echo $line | awk '{print $2}')
+            COST=$(echo $line | awk '{print $4}')
+            if [ "$COST" != "0.0" ] && [ "$COST" != "" ]; then
+              echo "| $SERVICE | \$$(printf "%.2f" $COST) |" >> cost-report.md
+            fi
+          done
+          echo "" >> cost-report.md
+
+      - name: Analyze Cost by Resource
+        run: |
+          echo "### Bookstore Application Costs" >> cost-report.md
+          
+          # Get date range
+          END_DATE=$(date +"%Y-%m-%d")
+          START_DATE=$(date -d '7 days ago' +"%Y-%m-%d")
+          
+          # Get cost for bookstore-tagged resources
+          BOOKSTORE_COST=$(aws ce get-cost-and-usage \
+            --time-period Start=$START_DATE,End=$END_DATE \
+            --granularity DAILY \
+            --metrics BlendedCost \
+            --group-by Type=TAG,Key=Application \
+            --filter '{
+              "Tags": {
+                "Key": "Application",
+                "Values": ["bookstore"],
+                "MatchOptions": ["EQUALS"]
+              }
+            }' \
+            --query 'ResultsByTime[].Groups[?Keys[0]==`bookstore`].Total.BlendedCost.Amount' \
+            --output text 2>/dev/null || echo "0")
+          
+          if [ "$BOOKSTORE_COST" != "0" ] && [ "$BOOKSTORE_COST" != "" ]; then
+            echo "**Bookstore Application Cost**: \$$(printf "%.2f" $BOOKSTORE_COST)" >> cost-report.md
+          else
+            echo "**Bookstore Application Cost**: Not available (check resource tagging)" >> cost-report.md
+          fi
+          echo "" >> cost-report.md
+
+      - name: Cost Trend Analysis
+        run: |
+          echo "### Cost Trend Analysis" >> cost-report.md
+          
+          # Get cost for last 30 days by day
+          END_DATE=$(date +"%Y-%m-%d")
+          START_DATE=$(date -d '30 days ago' +"%Y-%m-%d")
+          
+          # Calculate average daily cost
+          DAILY_COSTS=$(aws ce get-cost-and-usage \
+            --time-period Start=$START_DATE,End=$END_DATE \
+            --granularity DAILY \
+            --metrics BlendedCost \
+            --query 'ResultsByTime[].Total.BlendedCost.Amount' \
+            --output text)
+          
+          TOTAL_COST=0
+          DAY_COUNT=0
+          for cost in $DAILY_COSTS; do
+            TOTAL_COST=$(echo "$TOTAL_COST + $cost" | bc -l)
+            DAY_COUNT=$((DAY_COUNT + 1))
+          done
+          
+          if [ $DAY_COUNT -gt 0 ]; then
+            AVG_DAILY_COST=$(echo "scale=2; $TOTAL_COST / $DAY_COUNT" | bc -l)
+            MONTHLY_PROJECTION=$(echo "scale=2; $AVG_DAILY_COST * 30" | bc -l)
+            
+            echo "**Average Daily Cost**: \$$AVG_DAILY_COST" >> cost-report.md
+            echo "**Monthly Projection**: \$$MONTHLY_PROJECTION" >> cost-report.md
+          fi
+          echo "" >> cost-report.md
+
+      - name: Cost Optimization Recommendations
+        run: |
+          echo "### Cost Optimization Recommendations" >> cost-report.md
+          echo "" >> cost-report.md
+          
+          # Check for unused resources
+          echo "#### Potential Savings Opportunities:" >> cost-report.md
+          echo "" >> cost-report.md
+          
+          # Check for unattached EBS volumes
+          UNATTACHED_VOLUMES=$(aws ec2 describe-volumes \
+            --filters "Name=status,Values=available" \
+            --query 'Volumes[].{VolumeId:VolumeId,Size:Size,VolumeType:VolumeType}' \
+            --output json)
+          
+          VOLUME_COUNT=$(echo "$UNATTACHED_VOLUMES" | jq length)
+          if [ $VOLUME_COUNT -gt 0 ]; then
+            echo "🔸 **Unattached EBS Volumes**: $VOLUME_COUNT volumes found" >> cost-report.md
+            TOTAL_SIZE=$(echo "$UNATTACHED_VOLUMES" | jq '[.[].Size] | add')
+            echo "  - Total Size: ${TOTAL_SIZE}GB" >> cost-report.md
+            echo "  - Estimated Monthly Cost: \$$(echo "scale=2; $TOTAL_SIZE * 0.10" | bc -l)" >> cost-report.md
+          fi
+          
+          # Check for unused Elastic IPs
+          UNUSED_EIPS=$(aws ec2 describe-addresses \
+            --query 'Addresses[?!InstanceId].AllocationId' \
+            --output text | wc -w)
+          
+          if [ $UNUSED_EIPS -gt 0 ]; then
+            echo "🔸 **Unused Elastic IPs**: $UNUSED_EIPS EIPs found" >> cost-report.md
+            echo "  - Estimated Monthly Cost: \$$(echo "scale=2; $UNUSED_EIPS * 3.65" | bc -l)" >> cost-report.md
+          fi
+          
+          # Check for old snapshots
+          OLD_SNAPSHOTS=$(aws ec2 describe-snapshots \
+            --owner-ids self \
+            --query "Snapshots[?StartTime<='$(date -d '30 days ago' --iso-8601)'].{SnapshotId:SnapshotId,VolumeSize:VolumeSize}" \
+            --output json)
+          
+          OLD_SNAPSHOT_COUNT=$(echo "$OLD_SNAPSHOTS" | jq length)
+          if [ $OLD_SNAPSHOT_COUNT -gt 0 ]; then
+            echo "🔸 **Old Snapshots** (>30 days): $OLD_SNAPSHOT_COUNT snapshots found" >> cost-report.md
+            TOTAL_SNAPSHOT_SIZE=$(echo "$OLD_SNAPSHOTS" | jq '[.[].VolumeSize] | add // 0')
+            echo "  - Total Size: ${TOTAL_SNAPSHOT_SIZE}GB" >> cost-report.md
+            echo "  - Estimated Monthly Cost: \$$(echo "scale=2; $TOTAL_SNAPSHOT_SIZE * 0.05" | bc -l)" >> cost-report.md
+          fi
+          echo "" >> cost-report.md
+
+      - name: Generate Budget Analysis
+        run: |
+          echo "### Budget Analysis" >> cost-report.md
+          
+          # Get budget information if available
+          BUDGETS=$(aws budgets describe-budgets \
+            --account-id ${{ secrets.AWS_ACCOUNT_ID }} \
+            --query 'Budgets[?BudgetName==`bookstore-budget`]' \
+            --output json 2>/dev/null || echo "[]")
+          
+          if [ "$(echo "$BUDGETS" | jq length)" -gt 0 ]; then
+            BUDGET_AMOUNT=$(echo "$BUDGETS" | jq -r '.[0].BudgetLimit.Amount')
+            echo "**Monthly Budget**: \$$BUDGET_AMOUNT" >> cost-report.md
+            
+            # Calculate current month spend
+            CURRENT_MONTH_START=$(date +"%Y-%m-01")
+            CURRENT_DATE=$(date +"%Y-%m-%d")
+            
+            CURRENT_SPEND=$(aws ce get-cost-and-usage \
+              --time-period Start=$CURRENT_MONTH_START,End=$CURRENT_DATE \
+              --granularity MONTHLY \
+              --metrics BlendedCost \
+              --query 'ResultsByTime[0].Total.BlendedCost.Amount' \
+              --output text 2>/dev/null || echo "0")
+            
+            echo "**Current Month Spend**: \$$(printf "%.2f" $CURRENT_SPEND)" >> cost-report.md
+            
+            # Calculate percentage used
+            if [ "$CURRENT_SPEND" != "0" ] && [ "$BUDGET_AMOUNT" != "0" ]; then
+              PERCENTAGE=$(echo "scale=1; ($CURRENT_SPEND / $BUDGET_AMOUNT) * 100" | bc -l)
+              echo "**Budget Used**: $PERCENTAGE%" >> cost-report.md
+            fi
+          else
+            echo "**Budget**: Not configured - Consider setting up budget alerts" >> cost-report.md
+          fi
+          echo "" >> cost-report.md
+
+      - name: Upload Cost Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cost-analysis-report
+          path: cost-report.md
+
+  resource-cleanup:
+    name: Resource Cleanup
+    if: github.event.schedule == '0 5 * * 0' || github.event.inputs.operation == 'cleanup'
+    runs-on: ubuntu-latest
+    environment: resource-cleanup
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cleanup Old Snapshots
+        run: |
+          echo "## Resource Cleanup Report" >> cleanup-report.md
+          echo "### Cleanup Date: $(date)" >> cleanup-report.md
+          echo "" >> cleanup-report.md
+          
+          # Find snapshots older than 90 days
+          CUTOFF_DATE=$(date -d '90 days ago' --iso-8601)
+          
+          OLD_SNAPSHOTS=$(aws ec2 describe-snapshots \
+            --owner-ids self \
+            --query "Snapshots[?StartTime<='$CUTOFF_DATE' && contains(Description, 'bookstore')].SnapshotId" \
+            --output text)
+          
+          DELETED_COUNT=0
+          TOTAL_SIZE=0
+          
+          for snapshot in $OLD_SNAPSHOTS; do
+            if [ "$snapshot" != "None" ] && [ "$snapshot" != "" ]; then
+              # Get snapshot size before deletion
+              SIZE=$(aws ec2 describe-snapshots \
+                --snapshot-ids $snapshot \
+                --query 'Snapshots[0].VolumeSize' \
+                --output text)
+              
+              echo "Deleting old snapshot: $snapshot (${SIZE}GB)"
+              aws ec2 delete-snapshot --snapshot-id $snapshot
+              
+              DELETED_COUNT=$((DELETED_COUNT + 1))
+              TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+            fi
+          done
+          
+          echo "### Snapshot Cleanup" >> cleanup-report.md
+          echo "**Snapshots Deleted**: $DELETED_COUNT" >> cleanup-report.md
+          echo "**Total Size Freed**: ${TOTAL_SIZE}GB" >> cleanup-report.md
+          echo "**Estimated Monthly Savings**: \$$(echo "scale=2; $TOTAL_SIZE * 0.05" | bc -l)" >> cleanup-report.md
+          echo "" >> cleanup-report.md
+
+      - name: Cleanup Unused Log Groups
+        run: |
+          echo "### CloudWatch Log Group Cleanup" >> cleanup-report.md
+          
+          # Find log groups that haven't been written to in 30 days
+          CUTOFF_TIMESTAMP=$(date -d '30 days ago' +%s)000
+          
+          LOG_GROUPS=$(aws logs describe-log-groups \
+            --query "logGroups[?contains(logGroupName, 'bookstore') && lastEventTime < $CUTOFF_TIMESTAMP].logGroupName" \
+            --output text)
+          
+          DELETED_LOG_GROUPS=0
+          
+          for log_group in $LOG_GROUPS; do
+            if [ "$log_group" != "None" ] && [ "$log_group" != "" ]; then
+              echo "Deleting unused log group: $log_group"
+              aws logs delete-log-group --log-group-name $log_group
+              DELETED_LOG_GROUPS=$((DELETED_LOG_GROUPS + 1))
+            fi
+          done
+          
+          echo "**Log Groups Deleted**: $DELETED_LOG_GROUPS" >> cleanup-report.md
+          echo "" >> cleanup-report.md
+
+      - name: Cleanup Old ECR Images
+        run: |
+          echo "### ECR Image Cleanup" >> cleanup-report.md
+          
+          # Keep only the last 10 images in the bookstore-app repository
+          IMAGE_DIGESTS=$(aws ecr list-images \
+            --repository-name bookstore-app \
+            --filter tagStatus=UNTAGGED \
+            --query 'imageIds[?imageDigest!=null]' \
+            --output json 2>/dev/null || echo "[]")
+          
+          IMAGE_COUNT=$(echo "$IMAGE_DIGESTS" | jq length)
+          
+          if [ $IMAGE_COUNT -gt 10 ]; then
+            # Delete oldest untagged images
+            IMAGES_TO_DELETE=$(echo "$IMAGE_DIGESTS" | jq '.[10:]')
+            
+            if [ "$(echo "$IMAGES_TO_DELETE" | jq length)" -gt 0 ]; then
+              aws ecr batch-delete-image \
+                --repository-name bookstore-app \
+                --image-ids "$(echo "$IMAGES_TO_DELETE" | jq -c .)"
+              
+              DELETED_IMAGES=$(echo "$IMAGES_TO_DELETE" | jq length)
+              echo "**ECR Images Deleted**: $DELETED_IMAGES untagged images" >> cleanup-report.md
+            fi
+          else
+            echo "**ECR Images**: No cleanup needed (only $IMAGE_COUNT untagged images)" >> cleanup-report.md
+          fi
+          echo "" >> cleanup-report.md
+
+      - name: Upload Cleanup Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-cleanup-report
+          path: cleanup-report.md
+
+  rightsizing-analysis:
+    name: Resource Right-sizing Analysis
+    if: github.event.inputs.operation == 'rightsizing'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Analyze ECS Service Utilization
+        run: |
+          echo "# Right-sizing Analysis Report" >> rightsizing-report.md
+          echo "## Generated: $(date)" >> rightsizing-report.md
+          echo "" >> rightsizing-report.md
+          
+          echo "### ECS Service Analysis" >> rightsizing-report.md
+          
+          # Get ECS clusters
+          CLUSTERS=$(aws ecs list-clusters \
+            --query 'clusterArns[?contains(@, `bookstore`)]' \
+            --output text)
+          
+          for cluster in $CLUSTERS; do
+            CLUSTER_NAME=$(basename $cluster)
+            echo "#### Cluster: $CLUSTER_NAME" >> rightsizing-report.md
+            
+            # Get services in cluster
+            SERVICES=$(aws ecs list-services \
+              --cluster $cluster \
+              --query 'serviceArns' \
+              --output text)
+            
+            for service in $SERVICES; do
+              SERVICE_NAME=$(basename $service)
+              echo "**Service**: $SERVICE_NAME" >> rightsizing-report.md
+              
+              # Get service details
+              SERVICE_DETAILS=$(aws ecs describe-services \
+                --cluster $cluster \
+                --services $service \
+                --query 'services[0]' \
+                --output json)
+              
+              RUNNING_COUNT=$(echo "$SERVICE_DETAILS" | jq .runningCount)
+              DESIRED_COUNT=$(echo "$SERVICE_DETAILS" | jq .desiredCount)
+              
+              echo "- Running Tasks: $RUNNING_COUNT" >> rightsizing-report.md
+              echo "- Desired Tasks: $DESIRED_COUNT" >> rightsizing-report.md
+              
+              # Get CPU and memory utilization from CloudWatch
+              END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S")
+              START_TIME=$(date -u -d '7 days ago' +"%Y-%m-%dT%H:%M:%S")
+              
+              CPU_UTIL=$(aws cloudwatch get-metric-statistics \
+                --namespace AWS/ECS \
+                --metric-name CPUUtilization \
+                --dimensions Name=ServiceName,Value=$SERVICE_NAME Name=ClusterName,Value=$CLUSTER_NAME \
+                --statistics Average \
+                --start-time $START_TIME \
+                --end-time $END_TIME \
+                --period 86400 \
+                --query 'Datapoints[].Average' \
+                --output text 2>/dev/null || echo "No data")
+              
+              if [ "$CPU_UTIL" != "No data" ] && [ "$CPU_UTIL" != "" ]; then
+                AVG_CPU=$(echo "$CPU_UTIL" | awk '{sum+=$1; count++} END {if(count>0) print sum/count; else print 0}')
+                echo "- Average CPU Utilization (7 days): $(printf "%.1f" $AVG_CPU)%" >> rightsizing-report.md
+                
+                # Provide recommendations
+                if (( $(echo "$AVG_CPU < 20" | bc -l) )); then
+                  echo "  - 💡 **Recommendation**: Consider reducing CPU allocation (current avg: $(printf "%.1f" $AVG_CPU)%)" >> rightsizing-report.md
+                elif (( $(echo "$AVG_CPU > 80" | bc -l) )); then
+                  echo "  - ⚠️ **Recommendation**: Consider increasing CPU allocation (current avg: $(printf "%.1f" $AVG_CPU)%)" >> rightsizing-report.md
+                else
+                  echo "  - ✅ **Status**: CPU allocation appears optimal" >> rightsizing-report.md
+                fi
+              else
+                echo "- CPU Utilization: No data available" >> rightsizing-report.md
+              fi
+              
+              echo "" >> rightsizing-report.md
+            done
+          done
+
+      - name: Analyze RDS Instance Utilization
+        run: |
+          echo "### RDS Instance Analysis" >> rightsizing-report.md
+          
+          # Get RDS instances
+          RDS_INSTANCES=$(aws rds describe-db-instances \
+            --query 'DBInstances[?contains(DBInstanceIdentifier, `bookstore`)].{ID:DBInstanceIdentifier,Class:DBInstanceClass,Engine:Engine}' \
+            --output json)
+          
+          echo "$RDS_INSTANCES" | jq -r '.[] | "#### Instance: \(.ID)\n- Instance Class: \(.Class)\n- Engine: \(.Engine)"' >> rightsizing-report.md
+          
+          # Get CPU utilization for each instance
+          echo "$RDS_INSTANCES" | jq -r '.[].ID' | while read instance_id; do
+            END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S")
+            START_TIME=$(date -u -d '7 days ago' +"%Y-%m-%dT%H:%M:%S")
+            
+            CPU_UTIL=$(aws cloudwatch get-metric-statistics \
+              --namespace AWS/RDS \
+              --metric-name CPUUtilization \
+              --dimensions Name=DBInstanceIdentifier,Value=$instance_id \
+              --statistics Average \
+              --start-time $START_TIME \
+              --end-time $END_TIME \
+              --period 86400 \
+              --query 'Datapoints[].Average' \
+              --output text 2>/dev/null || echo "No data")
+            
+            if [ "$CPU_UTIL" != "No data" ] && [ "$CPU_UTIL" != "" ]; then
+              AVG_CPU=$(echo "$CPU_UTIL" | awk '{sum+=$1; count++} END {if(count>0) print sum/count; else print 0}')
+              echo "- Average CPU Utilization (7 days): $(printf "%.1f" $AVG_CPU)%" >> rightsizing-report.md
+              
+              if (( $(echo "$AVG_CPU < 20" | bc -l) )); then
+                echo "  - 💡 **Recommendation**: Consider downsizing instance class" >> rightsizing-report.md
+              elif (( $(echo "$AVG_CPU > 80" | bc -l) )); then
+                echo "  - ⚠️ **Recommendation**: Consider upgrading instance class" >> rightsizing-report.md
+              else
+                echo "  - ✅ **Status**: Instance size appears optimal" >> rightsizing-report.md
+              fi
+            fi
+            echo "" >> rightsizing-report.md
+          done
+
+      - name: Upload Right-sizing Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rightsizing-analysis-report
+          path: rightsizing-report.md
+
+  reserved-instances-analysis:
+    name: Reserved Instances Analysis
+    if: github.event.inputs.operation == 'reserved-instances'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Analyze Reserved Instance Opportunities
+        run: |
+          echo "# Reserved Instances Analysis Report" >> ri-report.md
+          echo "## Generated: $(date)" >> ri-report.md
+          echo "" >> ri-report.md
+          
+          echo "### Current Reserved Instances" >> ri-report.md
+          
+          # Get current reserved instances
+          RESERVED_INSTANCES=$(aws ec2 describe-reserved-instances \
+            --filters "Name=state,Values=active" \
+            --query 'ReservedInstances[].{InstanceType:InstanceType,InstanceCount:InstanceCount,End:End}' \
+            --output json)
+          
+          if [ "$(echo "$RESERVED_INSTANCES" | jq length)" -eq 0 ]; then
+            echo "**No active reserved instances found**" >> ri-report.md
+          else
+            echo "| Instance Type | Count | Expiration |" >> ri-report.md
+            echo "|---------------|-------|------------|" >> ri-report.md
+            echo "$RESERVED_INSTANCES" | jq -r '.[] | "| \(.InstanceType) | \(.InstanceCount) | \(.End) |"' >> ri-report.md
+          fi
+          echo "" >> ri-report.md
+          
+          echo "### RDS Reserved Instances" >> ri-report.md
+          
+          # Get RDS reserved instances
+          RDS_RESERVED=$(aws rds describe-reserved-db-instances \
+            --query 'ReservedDBInstances[?State==`active`].{Class:DBInstanceClass,Count:DBInstanceCount,End:StartTime}' \
+            --output json)
+          
+          if [ "$(echo "$RDS_RESERVED" | jq length)" -eq 0 ]; then
+            echo "**No active RDS reserved instances found**" >> ri-report.md
+          else
+            echo "| Instance Class | Count | Started |" >> ri-report.md
+            echo "|----------------|-------|---------|" >> ri-report.md
+            echo "$RDS_RESERVED" | jq -r '.[] | "| \(.Class) | \(.Count) | \(.End) |"' >> ri-report.md
+          fi
+          echo "" >> ri-report.md
+
+      - name: Generate RI Recommendations
+        run: |
+          echo "### Reserved Instance Recommendations" >> ri-report.md
+          echo "" >> ri-report.md
+          
+          # Analyze running instances for RI opportunities
+          RUNNING_INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=instance-state-name,Values=running" "Name=tag:Application,Values=bookstore" \
+            --query 'Reservations[].Instances[].{InstanceType:InstanceType,InstanceId:InstanceId,LaunchTime:LaunchTime}' \
+            --output json)
+          
+          # Group by instance type
+          echo "$RUNNING_INSTANCES" | jq -r 'group_by(.InstanceType) | .[] | "\(.[0].InstanceType): \(length) instances"' > instance-summary.txt
+          
+          echo "#### EC2 Reserved Instance Opportunities:" >> ri-report.md
+          
+          while read line; do
+            INSTANCE_TYPE=$(echo $line | cut -d':' -f1)
+            COUNT=$(echo $line | cut -d':' -f2 | tr -d ' instances')
+            
+            if [ $COUNT -ge 1 ]; then
+              # Calculate potential savings (approximate)
+              case $INSTANCE_TYPE in
+                "t3.micro"|"t3.small")
+                  SAVINGS_PERCENT="30"
+                  ;;
+                "t3.medium"|"t3.large")
+                  SAVINGS_PERCENT="35"
+                  ;;
+                *)
+                  SAVINGS_PERCENT="40"
+                  ;;
+              esac
+              
+              echo "🔸 **$INSTANCE_TYPE**: $COUNT instances running" >> ri-report.md
+              echo "  - Estimated savings with 1-year RI: ~$SAVINGS_PERCENT%" >> ri-report.md
+              echo "  - Recommendation: Consider purchasing $COUNT x $INSTANCE_TYPE reserved instances" >> ri-report.md
+            fi
+          done < instance-summary.txt
+          
+          echo "" >> ri-report.md
+
+      - name: RDS RI Analysis
+        run: |
+          echo "#### RDS Reserved Instance Opportunities:" >> ri-report.md
+          
+          # Get running RDS instances
+          RDS_INSTANCES=$(aws rds describe-db-instances \
+            --query 'DBInstances[?DBInstanceStatus==`available` && contains(DBInstanceIdentifier, `bookstore`)].{Class:DBInstanceClass,Engine:Engine,ID:DBInstanceIdentifier}' \
+            --output json)
+          
+          if [ "$(echo "$RDS_INSTANCES" | jq length)" -eq 0 ]; then
+            echo "**No running RDS instances found**" >> ri-report.md
+          else
+            echo "$RDS_INSTANCES" | jq -r '.[] | "🔸 **\(.Class)** (\(.Engine)): Instance \(.ID)\n  - Estimated savings with 1-year RI: ~40-60%\n  - Recommendation: Consider purchasing reserved instance for consistent workloads"' >> ri-report.md
+          fi
+          echo "" >> ri-report.md
+          
+          echo "### Cost Impact Analysis" >> ri-report.md
+          echo "📊 **Potential Annual Savings**: Reserved instances typically provide 30-60% savings compared to on-demand pricing" >> ri-report.md
+          echo "⏰ **Commitment**: Reserved instances require 1 or 3-year commitments" >> ri-report.md
+          echo "🎯 **Best Candidates**: Workloads running 24/7 with predictable usage patterns" >> ri-report.md
+
+      - name: Upload RI Analysis Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: reserved-instances-analysis-report
+          path: ri-report.md
+
+  cost-alert-check:
+    name: Cost Alert Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check Current Month Spend
+        run: |
+          # Get current month spend
+          CURRENT_MONTH_START=$(date +"%Y-%m-01")
+          CURRENT_DATE=$(date +"%Y-%m-%d")
+          
+          CURRENT_SPEND=$(aws ce get-cost-and-usage \
+            --time-period Start=$CURRENT_MONTH_START,End=$CURRENT_DATE \
+            --granularity MONTHLY \
+            --metrics BlendedCost \
+            --query 'ResultsByTime[0].Total.BlendedCost.Amount' \
+            --output text 2>/dev/null || echo "0")
+          
+          echo "Current month spend: \$$(printf "%.2f" $CURRENT_SPEND)"
+          
+          # Set cost thresholds
+          WARNING_THRESHOLD=100
+          CRITICAL_THRESHOLD=200
+          
+          if (( $(echo "$CURRENT_SPEND > $CRITICAL_THRESHOLD" | bc -l) )); then
+            aws sns publish \
+              --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-production \
+              --message "🚨 CRITICAL COST ALERT: Current month spend (\$$CURRENT_SPEND) has exceeded critical threshold (\$$CRITICAL_THRESHOLD)" \
+              --subject "Bookstore Critical Cost Alert"
+          elif (( $(echo "$CURRENT_SPEND > $WARNING_THRESHOLD" | bc -l) )); then
+            aws sns publish \
+              --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-production \
+              --message "⚠️ COST WARNING: Current month spend (\$$CURRENT_SPEND) has exceeded warning threshold (\$$WARNING_THRESHOLD)" \
+              --subject "Bookstore Cost Warning"
+          fi
+
+  generate-cost-summary:
+    name: Generate Cost Summary
+    runs-on: ubuntu-latest
+    needs: [cost-analysis, resource-cleanup, cost-alert-check]
+    if: always()
+    
+    steps:
+      - name: Download Reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+        continue-on-error: true
+
+      - name: Generate Summary
+        run: |
+          echo "## 💰 AWS Cost Optimization Summary" >> $GITHUB_STEP_SUMMARY
+          echo "### Date: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Status:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cost Analysis**: ${{ needs.cost-analysis.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Resource Cleanup**: ${{ needs.resource-cleanup.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cost Alert Check**: ${{ needs.cost-alert-check.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Actions Taken:" >> $GITHUB_STEP_SUMMARY
+          echo "- Generated detailed cost analysis report" >> $GITHUB_STEP_SUMMARY
+          echo "- Cleaned up unused resources (if applicable)" >> $GITHUB_STEP_SUMMARY
+          echo "- Checked cost thresholds and sent alerts if needed" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "- Review cost analysis reports in artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Implement recommended cost optimizations" >> $GITHUB_STEP_SUMMARY
+          echo "- Consider reserved instances for long-running workloads" >> $GITHUB_STEP_SUMMARY

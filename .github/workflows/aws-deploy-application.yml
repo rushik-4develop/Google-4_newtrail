@@ -1,0 +1,255 @@
+name: Deploy Book Store Application to AWS
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - 'package*.json'
+      - 'requirements.txt'
+      - '.github/workflows/aws-deploy-application.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: bookstore-app
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Linting
+        run: npm run lint
+
+      - name: Run Unit Tests
+        run: npm test
+
+      - name: Run Integration Tests
+        run: npm run test:integration
+
+      - name: Generate Test Coverage
+        run: npm run test:coverage
+
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    outputs:
+      image-tag: ${{ steps.build-image.outputs.image-tag }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build Docker image
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          
+          # Push images to ECR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Scan Docker image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.build-image.outputs.image-tag }}
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+
+      - name: Upload Docker image scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+
+  deploy:
+    name: Deploy to ECS
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition bookstore-app-${{ github.event.inputs.environment || 'dev' }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: bookstore-app
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image-tag }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: bookstore-service-${{ github.event.inputs.environment || 'dev' }}
+          cluster: bookstore-cluster-${{ github.event.inputs.environment || 'dev' }}
+          wait-for-service-stability: true
+
+      - name: Run Database Migrations
+        run: |
+          TASK_ARN=$(aws ecs run-task \
+            --cluster bookstore-cluster-${{ github.event.inputs.environment || 'dev' }} \
+            --task-definition bookstore-app-${{ github.event.inputs.environment || 'dev' }} \
+            --overrides '{
+              "containerOverrides": [{
+                "name": "bookstore-app",
+                "command": ["npm", "run", "migrate"]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' \
+            --output text)
+          
+          aws ecs wait tasks-stopped --cluster bookstore-cluster-${{ github.event.inputs.environment || 'dev' }} --tasks $TASK_ARN
+
+      - name: Update Deployment Status
+        run: |
+          echo "## Deployment Complete! 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "### Environment: ${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Image Tag: ${{ needs.build-and-push.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Service URL: https://bookstore-${{ github.event.inputs.environment || 'dev' }}.example.com" >> $GITHUB_STEP_SUMMARY
+
+  post-deploy:
+    name: Post-Deployment Tasks
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run Health Checks
+        run: |
+          # Wait for service to be stable
+          sleep 30
+          
+          # Get the load balancer URL
+          LB_URL=$(aws elbv2 describe-load-balancers \
+            --names bookstore-alb-${{ github.event.inputs.environment || 'dev' }} \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          
+          # Health check
+          for i in {1..10}; do
+            if curl -f "http://$LB_URL/health"; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            echo "Health check attempt $i failed, retrying in 30 seconds..."
+            sleep 30
+          done
+          
+          echo "Health checks failed"
+          exit 1
+
+      - name: Update CloudWatch Dashboard
+        run: |
+          aws cloudwatch put-dashboard \
+            --dashboard-name "BookStore-${{ github.event.inputs.environment || 'dev' }}" \
+            --dashboard-body file://cloudwatch-dashboard.json
+
+      - name: Send Slack Notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow

@@ -1,0 +1,383 @@
+name: AWS Workflow Dependencies Management
+
+on:
+  schedule:
+    # Check for updates weekly on Sundays at 4 AM UTC
+    - cron: '0 4 * * 0'
+  push:
+    branches: [ "main" ]
+    paths:
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      update_type:
+        description: 'Type of update to perform'
+        required: true
+        default: 'check'
+        type: choice
+        options:
+          - check
+          - update-actions
+          - update-tools
+          - security-audit
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  check-action-versions:
+    name: Check GitHub Action Versions
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Action Version Checker
+        run: |
+          npm install -g @github/action-updater
+
+      - name: Check for Action Updates
+        run: |
+          echo "## GitHub Action Version Check" >> action-updates.md
+          echo "### Current Status: $(date)" >> action-updates.md
+          echo "" >> action-updates.md
+          
+          # Find all workflow files
+          WORKFLOW_FILES=$(find .github/workflows -name "*.yml" -o -name "*.yaml")
+          
+          for file in $WORKFLOW_FILES; do
+            echo "Checking $file for action updates..."
+            echo "### File: $file" >> action-updates.md
+            
+            # Extract action versions (simplified check)
+            grep -n "uses:" "$file" | while read line; do
+              echo "- $line" >> action-updates.md
+            done
+            echo "" >> action-updates.md
+          done
+
+      - name: Check for Security Updates
+        run: |
+          echo "## Security Updates Required" >> action-updates.md
+          echo "" >> action-updates.md
+          
+          # Check for actions with known security issues
+          SECURITY_ACTIONS=(
+            "actions/checkout@v3"
+            "actions/setup-node@v3"
+            "aws-actions/configure-aws-credentials@v3"
+          )
+          
+          for action in "${SECURITY_ACTIONS[@]}"; do
+            if grep -r "$action" .github/workflows/; then
+              echo "⚠️ **Security Update Required**: $action should be updated to latest version" >> action-updates.md
+            fi
+          done
+
+      - name: Upload Action Update Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: action-updates-report
+          path: action-updates.md
+
+  check-tool-versions:
+    name: Check Tool Versions
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Check Terraform Version
+        run: |
+          echo "## Tool Version Check" >> tool-versions.md
+          echo "### Current Status: $(date)" >> tool-versions.md
+          echo "" >> tool-versions.md
+          
+          # Check current Terraform version in workflows
+          CURRENT_TF_VERSION=$(grep "TERRAFORM_VERSION:" .github/workflows/aws-deploy-infrastructure.yml | cut -d':' -f2 | tr -d ' ')
+          echo "**Current Terraform Version**: $CURRENT_TF_VERSION" >> tool-versions.md
+          
+          # Get latest Terraform version
+          LATEST_TF_VERSION=$(curl -s https://api.github.com/repos/hashicorp/terraform/releases/latest | jq -r .tag_name | sed 's/v//')
+          echo "**Latest Terraform Version**: $LATEST_TF_VERSION" >> tool-versions.md
+          
+          if [ "$CURRENT_TF_VERSION" != "$LATEST_TF_VERSION" ]; then
+            echo "⚠️ **Update Available**: Terraform can be updated from $CURRENT_TF_VERSION to $LATEST_TF_VERSION" >> tool-versions.md
+          else
+            echo "✅ **Up to Date**: Terraform is using the latest version" >> tool-versions.md
+          fi
+          echo "" >> tool-versions.md
+
+      - name: Check AWS CLI Version
+        run: |
+          echo "### AWS CLI Version Check" >> tool-versions.md
+          
+          # Get latest AWS CLI version
+          LATEST_AWS_CLI=$(curl -s https://api.github.com/repos/aws/aws-cli/releases/latest | jq -r .tag_name)
+          echo "**Latest AWS CLI Version**: $LATEST_AWS_CLI" >> tool-versions.md
+          echo "" >> tool-versions.md
+
+      - name: Check Security Tool Versions
+        run: |
+          echo "### Security Tools Version Check" >> tool-versions.md
+          
+          # Check Trivy version
+          echo "**Trivy**: Using aquasecurity/trivy-action@master (latest)" >> tool-versions.md
+          
+          # Check OWASP ZAP version
+          ZAP_VERSION=$(grep "ZAP_.*_Linux.tar.gz" .github/workflows/aws-security-compliance.yml | grep -o "v[0-9]*\.[0-9]*\.[0-9]*" | head -1)
+          echo "**OWASP ZAP**: $ZAP_VERSION" >> tool-versions.md
+          
+          # Get latest ZAP version
+          LATEST_ZAP=$(curl -s https://api.github.com/repos/zaproxy/zaproxy/releases/latest | jq -r .tag_name)
+          echo "**Latest OWASP ZAP**: $LATEST_ZAP" >> tool-versions.md
+          
+          if [ "$ZAP_VERSION" != "$LATEST_ZAP" ]; then
+            echo "⚠️ **Update Available**: OWASP ZAP can be updated from $ZAP_VERSION to $LATEST_ZAP" >> tool-versions.md
+          else
+            echo "✅ **Up to Date**: OWASP ZAP is using the latest version" >> tool-versions.md
+          fi
+          echo "" >> tool-versions.md
+
+      - name: Upload Tool Version Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool-versions-report
+          path: tool-versions.md
+
+  update-actions:
+    name: Update GitHub Actions
+    if: github.event.inputs.update_type == 'update-actions' || github.event.schedule
+    runs-on: ubuntu-latest
+    needs: [check-action-versions]
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Action Versions
+        run: |
+          # Update common actions to latest versions
+          ACTION_UPDATES=(
+            "s/actions\/checkout@v3/actions\/checkout@v4/g"
+            "s/actions\/setup-node@v3/actions\/setup-node@v4/g"
+            "s/aws-actions\/configure-aws-credentials@v3/aws-actions\/configure-aws-credentials@v4/g"
+            "s/actions\/upload-artifact@v3/actions\/upload-artifact@v4/g"
+            "s/actions\/download-artifact@v3/actions\/download-artifact@v4/g"
+            "s/github\/codeql-action\/upload-sarif@v2/github\/codeql-action\/upload-sarif@v3/g"
+            "s/hashicorp\/setup-terraform@v2/hashicorp\/setup-terraform@v3/g"
+          )
+          
+          # Apply updates to all workflow files
+          for update in "${ACTION_UPDATES[@]}"; do
+            find .github/workflows -name "*.yml" -exec sed -i "$update" {} \;
+          done
+          
+          # Check if any changes were made
+          if git diff --quiet; then
+            echo "No action updates were needed"
+          else
+            echo "Action updates were applied"
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git add .github/workflows/
+            git commit -m "chore: update GitHub Actions to latest versions"
+            git push
+          fi
+
+  update-tools:
+    name: Update Tool Versions
+    if: github.event.inputs.update_type == 'update-tools'
+    runs-on: ubuntu-latest
+    needs: [check-tool-versions]
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Terraform Version
+        run: |
+          # Get latest Terraform version
+          LATEST_TF_VERSION=$(curl -s https://api.github.com/repos/hashicorp/terraform/releases/latest | jq -r .tag_name | sed 's/v//')
+          
+          # Update Terraform version in infrastructure workflow
+          sed -i "s/TERRAFORM_VERSION: [0-9.]*/TERRAFORM_VERSION: $LATEST_TF_VERSION/" .github/workflows/aws-deploy-infrastructure.yml
+          
+          echo "Updated Terraform version to $LATEST_TF_VERSION"
+
+      - name: Update Security Tools
+        run: |
+          # Get latest OWASP ZAP version
+          LATEST_ZAP=$(curl -s https://api.github.com/repos/zaproxy/zaproxy/releases/latest | jq -r .tag_name)
+          
+          # Update ZAP version in security workflow
+          sed -i "s/ZAP_[0-9.]*/ZAP_${LATEST_ZAP#v}/" .github/workflows/aws-security-compliance.yml
+          sed -i "s/${LATEST_ZAP#v}[^/]*/${LATEST_ZAP#v}/" .github/workflows/aws-security-compliance.yml
+          
+          echo "Updated OWASP ZAP version to $LATEST_ZAP"
+
+      - name: Commit Tool Updates
+        run: |
+          if git diff --quiet; then
+            echo "No tool updates were needed"
+          else
+            echo "Tool updates were applied"
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git add .github/workflows/
+            git commit -m "chore: update tool versions to latest releases"
+            git push
+          fi
+
+  security-audit:
+    name: Security Audit of Workflows
+    if: github.event.inputs.update_type == 'security-audit' || github.event.schedule
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Audit Workflow Security
+        run: |
+          echo "## Workflow Security Audit" >> security-audit.md
+          echo "### Audit Date: $(date)" >> security-audit.md
+          echo "" >> security-audit.md
+          
+          # Check for hardcoded secrets
+          echo "### Hardcoded Secrets Check" >> security-audit.md
+          if grep -r "password\|secret\|key" .github/workflows/ --include="*.yml" | grep -v "secrets\."; then
+            echo "⚠️ **Potential hardcoded secrets found**" >> security-audit.md
+          else
+            echo "✅ **No hardcoded secrets detected**" >> security-audit.md
+          fi
+          echo "" >> security-audit.md
+          
+          # Check for privileged actions
+          echo "### Privileged Actions Check" >> security-audit.md
+          PRIVILEGED_ACTIONS=$(grep -r "uses:.*docker" .github/workflows/ --include="*.yml" | wc -l)
+          echo "**Docker-related actions found**: $PRIVILEGED_ACTIONS" >> security-audit.md
+          echo "" >> security-audit.md
+          
+          # Check for external dependencies
+          echo "### External Dependencies Check" >> security-audit.md
+          echo "**Third-party actions used**:" >> security-audit.md
+          grep -r "uses:" .github/workflows/ --include="*.yml" | grep -v "actions/" | grep -v "aws-actions/" | cut -d':' -f3 | sort -u | while read action; do
+            echo "- $action" >> security-audit.md
+          done
+          echo "" >> security-audit.md
+
+      - name: Check Workflow Permissions
+        run: |
+          echo "### Workflow Permissions Check" >> security-audit.md
+          
+          # Check for workflows with write permissions
+          if grep -r "permissions:" .github/workflows/ --include="*.yml"; then
+            echo "**Workflows with explicit permissions found** - Review for least privilege" >> security-audit.md
+          else
+            echo "**No explicit permissions found** - Using default permissions" >> security-audit.md
+          fi
+          echo "" >> security-audit.md
+
+      - name: Check for Sensitive Environment Variables
+        run: |
+          echo "### Environment Variables Check" >> security-audit.md
+          
+          # Look for potentially sensitive environment variables
+          SENSITIVE_VARS=$(grep -r "env:" .github/workflows/ --include="*.yml" -A 5 | grep -E "PASSWORD|SECRET|KEY|TOKEN" | wc -l)
+          echo "**Potentially sensitive environment variables**: $SENSITIVE_VARS" >> security-audit.md
+          echo "" >> security-audit.md
+
+      - name: Upload Security Audit Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-report
+          path: security-audit.md
+
+  generate-maintenance-report:
+    name: Generate Maintenance Report
+    runs-on: ubuntu-latest
+    needs: [check-action-versions, check-tool-versions, security-audit]
+    if: always()
+    
+    steps:
+      - name: Download All Reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+
+      - name: Generate Combined Report
+        run: |
+          echo "# AWS Workflows Maintenance Report" >> maintenance-report.md
+          echo "## Generated: $(date)" >> maintenance-report.md
+          echo "" >> maintenance-report.md
+          
+          # Combine all reports
+          if [ -f "reports/action-updates-report/action-updates.md" ]; then
+            cat reports/action-updates-report/action-updates.md >> maintenance-report.md
+            echo "" >> maintenance-report.md
+          fi
+          
+          if [ -f "reports/tool-versions-report/tool-versions.md" ]; then
+            cat reports/tool-versions-report/tool-versions.md >> maintenance-report.md
+            echo "" >> maintenance-report.md
+          fi
+          
+          if [ -f "reports/security-audit-report/security-audit.md" ]; then
+            cat reports/security-audit-report/security-audit.md >> maintenance-report.md
+            echo "" >> maintenance-report.md
+          fi
+          
+          # Add recommendations
+          echo "## Recommendations" >> maintenance-report.md
+          echo "1. Review and apply any available action updates" >> maintenance-report.md
+          echo "2. Update tool versions to latest stable releases" >> maintenance-report.md
+          echo "3. Address any security audit findings" >> maintenance-report.md
+          echo "4. Test updated workflows in development environment" >> maintenance-report.md
+          echo "5. Schedule regular dependency reviews" >> maintenance-report.md
+
+      - name: Upload Combined Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintenance-report
+          path: maintenance-report.md
+
+      - name: Create Issue for Updates
+        if: github.event.schedule
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('maintenance-report.md', 'utf8');
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Weekly AWS Workflows Maintenance Report - ${new Date().toISOString().split('T')[0]}`,
+              body: report,
+              labels: ['maintenance', 'workflows', 'aws']
+            });
+
+      - name: Generate Summary
+        run: |
+          echo "## 🔧 Workflow Maintenance Summary" >> $GITHUB_STEP_SUMMARY
+          echo "### Maintenance Date: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "### Status:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action Version Check**: ${{ needs.check-action-versions.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tool Version Check**: ${{ needs.check-tool-versions.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security Audit**: ${{ needs.security-audit.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "- Review maintenance report artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Apply recommended updates" >> $GITHUB_STEP_SUMMARY
+          echo "- Test updated workflows" >> $GITHUB_STEP_SUMMARY

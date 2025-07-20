@@ -1,0 +1,327 @@
+name: AWS Monitoring and Alerting Setup
+
+on:
+  schedule:
+    # Run monitoring checks every 15 minutes
+    - cron: '*/15 * * * *'
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'monitoring/**'
+      - '.github/workflows/aws-monitoring-alerts.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to monitor'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  health-checks:
+    name: Application Health Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check Application Health
+        id: health-check
+        run: |
+          # Get the load balancer URL
+          LB_URL=$(aws elbv2 describe-load-balancers \
+            --names bookstore-alb-${{ github.event.inputs.environment || 'dev' }} \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text 2>/dev/null || echo "not-found")
+          
+          if [ "$LB_URL" = "not-found" ]; then
+            echo "Load balancer not found for environment ${{ github.event.inputs.environment || 'dev' }}"
+            echo "healthy=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check application endpoints
+          ENDPOINTS=("/health" "/api/books" "/api/health")
+          FAILED_ENDPOINTS=""
+          
+          for endpoint in "${ENDPOINTS[@]}"; do
+            echo "Checking endpoint: $endpoint"
+            if ! curl -f -s --max-time 30 "http://$LB_URL$endpoint" > /dev/null; then
+              FAILED_ENDPOINTS="$FAILED_ENDPOINTS $endpoint"
+            fi
+          done
+          
+          if [ -n "$FAILED_ENDPOINTS" ]; then
+            echo "Failed endpoints:$FAILED_ENDPOINTS" >> $GITHUB_OUTPUT
+            echo "healthy=false" >> $GITHUB_OUTPUT
+          else
+            echo "healthy=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check Database Connectivity
+        run: |
+          # Get RDS endpoint
+          DB_ENDPOINT=$(aws rds describe-db-instances \
+            --db-instance-identifier bookstore-db-${{ github.event.inputs.environment || 'dev' }} \
+            --query 'DBInstances[0].Endpoint.Address' \
+            --output text 2>/dev/null || echo "not-found")
+          
+          if [ "$DB_ENDPOINT" = "not-found" ]; then
+            echo "Database not found for environment ${{ github.event.inputs.environment || 'dev' }}"
+            exit 0
+          fi
+          
+          # Check database connectivity (using a simple TCP check)
+          timeout 10 bash -c "</dev/tcp/$DB_ENDPOINT/5432" && echo "Database is reachable" || echo "Database connectivity failed"
+
+      - name: Send Alert if Unhealthy
+        if: steps.health-check.outputs.healthy == 'false'
+        run: |
+          aws sns publish \
+            --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-${{ github.event.inputs.environment || 'dev' }} \
+            --message "🚨 ALERT: Bookstore application health check failed in ${{ github.event.inputs.environment || 'dev' }} environment. Failed endpoints: ${{ steps.health-check.outputs.failed-endpoints }}" \
+            --subject "Bookstore Health Check Failed"
+
+  performance-monitoring:
+    name: Performance and Metrics Monitoring
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check CloudWatch Metrics
+        run: |
+          # Get current time and 5 minutes ago
+          END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S")
+          START_TIME=$(date -u -d '5 minutes ago' +"%Y-%m-%dT%H:%M:%S")
+          
+          # Check ECS Service metrics
+          CPU_UTILIZATION=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/ECS \
+            --metric-name CPUUtilization \
+            --dimensions Name=ServiceName,Value=bookstore-service-${{ github.event.inputs.environment || 'dev' }} Name=ClusterName,Value=bookstore-cluster-${{ github.event.inputs.environment || 'dev' }} \
+            --statistics Average \
+            --start-time $START_TIME \
+            --end-time $END_TIME \
+            --period 300 \
+            --query 'Datapoints[0].Average' \
+            --output text 2>/dev/null || echo "null")
+          
+          MEMORY_UTILIZATION=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/ECS \
+            --metric-name MemoryUtilization \
+            --dimensions Name=ServiceName,Value=bookstore-service-${{ github.event.inputs.environment || 'dev' }} Name=ClusterName,Value=bookstore-cluster-${{ github.event.inputs.environment || 'dev' }} \
+            --statistics Average \
+            --start-time $START_TIME \
+            --end-time $END_TIME \
+            --period 300 \
+            --query 'Datapoints[0].Average' \
+            --output text 2>/dev/null || echo "null")
+          
+          echo "CPU Utilization: $CPU_UTILIZATION%"
+          echo "Memory Utilization: $MEMORY_UTILIZATION%"
+          
+          # Check if metrics exceed thresholds
+          if [ "$CPU_UTILIZATION" != "null" ] && [ "$CPU_UTILIZATION" != "None" ]; then
+            if (( $(echo "$CPU_UTILIZATION > 80" | bc -l) )); then
+              aws sns publish \
+                --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-${{ github.event.inputs.environment || 'dev' }} \
+                --message "⚠️ WARNING: High CPU utilization detected: $CPU_UTILIZATION%" \
+                --subject "Bookstore High CPU Alert"
+            fi
+          fi
+          
+          if [ "$MEMORY_UTILIZATION" != "null" ] && [ "$MEMORY_UTILIZATION" != "None" ]; then
+            if (( $(echo "$MEMORY_UTILIZATION > 80" | bc -l) )); then
+              aws sns publish \
+                --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-${{ github.event.inputs.environment || 'dev' }} \
+                --message "⚠️ WARNING: High memory utilization detected: $MEMORY_UTILIZATION%" \
+                --subject "Bookstore High Memory Alert"
+            fi
+          fi
+
+      - name: Check Application Load Balancer Metrics
+        run: |
+          # Get current time and 5 minutes ago
+          END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S")
+          START_TIME=$(date -u -d '5 minutes ago' +"%Y-%m-%dT%H:%M:%S")
+          
+          # Get Load Balancer ARN
+          LB_ARN=$(aws elbv2 describe-load-balancers \
+            --names bookstore-alb-${{ github.event.inputs.environment || 'dev' }} \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text 2>/dev/null || echo "not-found")
+          
+          if [ "$LB_ARN" != "not-found" ]; then
+            # Check response times
+            RESPONSE_TIME=$(aws cloudwatch get-metric-statistics \
+              --namespace AWS/ApplicationELB \
+              --metric-name TargetResponseTime \
+              --dimensions Name=LoadBalancer,Value=$(echo $LB_ARN | cut -d'/' -f2-) \
+              --statistics Average \
+              --start-time $START_TIME \
+              --end-time $END_TIME \
+              --period 300 \
+              --query 'Datapoints[0].Average' \
+              --output text 2>/dev/null || echo "null")
+            
+            # Check 5XX error rate
+            ERROR_5XX=$(aws cloudwatch get-metric-statistics \
+              --namespace AWS/ApplicationELB \
+              --metric-name HTTPCode_Target_5XX_Count \
+              --dimensions Name=LoadBalancer,Value=$(echo $LB_ARN | cut -d'/' -f2-) \
+              --statistics Sum \
+              --start-time $START_TIME \
+              --end-time $END_TIME \
+              --period 300 \
+              --query 'Datapoints[0].Sum' \
+              --output text 2>/dev/null || echo "0")
+            
+            echo "Average Response Time: $RESPONSE_TIME seconds"
+            echo "5XX Errors: $ERROR_5XX"
+            
+            # Alert on high response time (> 2 seconds)
+            if [ "$RESPONSE_TIME" != "null" ] && [ "$RESPONSE_TIME" != "None" ]; then
+              if (( $(echo "$RESPONSE_TIME > 2" | bc -l) )); then
+                aws sns publish \
+                  --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-${{ github.event.inputs.environment || 'dev' }} \
+                  --message "⚠️ WARNING: High response time detected: $RESPONSE_TIME seconds" \
+                  --subject "Bookstore High Response Time Alert"
+              fi
+            fi
+            
+            # Alert on 5XX errors
+            if [ "$ERROR_5XX" != "0" ] && [ "$ERROR_5XX" != "null" ]; then
+              aws sns publish \
+                --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-${{ github.event.inputs.environment || 'dev' }} \
+                --message "🚨 ALERT: 5XX errors detected: $ERROR_5XX errors in the last 5 minutes" \
+                --subject "Bookstore 5XX Errors Alert"
+            fi
+          fi
+
+  cost-monitoring:
+    name: Cost Monitoring
+    runs-on: ubuntu-latest
+    if: github.event.schedule || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check Daily Costs
+        run: |
+          # Get yesterday's date
+          YESTERDAY=$(date -u -d '1 day ago' +"%Y-%m-%d")
+          TODAY=$(date -u +"%Y-%m-%d")
+          
+          # Get cost for the bookstore application
+          DAILY_COST=$(aws ce get-cost-and-usage \
+            --time-period Start=$YESTERDAY,End=$TODAY \
+            --granularity DAILY \
+            --metrics BlendedCost \
+            --group-by Type=DIMENSION,Key=SERVICE \
+            --filter file://<(echo '{
+              "Dimensions": {
+                "Key": "RESOURCE_ID",
+                "Values": ["*bookstore*"],
+                "MatchOptions": ["CONTAINS"]
+              }
+            }') \
+            --query 'ResultsByTime[0].Total.BlendedCost.Amount' \
+            --output text 2>/dev/null || echo "0")
+          
+          echo "Daily cost for bookstore resources: \$$DAILY_COST"
+          
+          # Alert if daily cost exceeds threshold ($50)
+          if (( $(echo "$DAILY_COST > 50" | bc -l) )); then
+            aws sns publish \
+              --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-${{ github.event.inputs.environment || 'dev' }} \
+              --message "💰 COST ALERT: Daily cost for bookstore resources exceeded \$50. Current cost: \$$DAILY_COST" \
+              --subject "Bookstore High Cost Alert"
+          fi
+
+  security-monitoring:
+    name: Security Monitoring
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check GuardDuty Findings
+        run: |
+          # Get GuardDuty detector ID
+          DETECTOR_ID=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text 2>/dev/null || echo "none")
+          
+          if [ "$DETECTOR_ID" != "none" ] && [ "$DETECTOR_ID" != "null" ]; then
+            # Check for high severity findings in the last hour
+            FINDINGS=$(aws guardduty list-findings \
+              --detector-id $DETECTOR_ID \
+              --finding-criteria '{
+                "Criterion": {
+                  "severity": {
+                    "Gte": 7.0
+                  },
+                  "updatedAt": {
+                    "Gte": '$(date -u -d '1 hour ago' +%s000)'
+                  }
+                }
+              }' \
+              --query 'FindingIds' \
+              --output text)
+            
+            if [ "$FINDINGS" != "" ] && [ "$FINDINGS" != "None" ]; then
+              aws sns publish \
+                --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-${{ github.event.inputs.environment || 'dev' }} \
+                --message "🔒 SECURITY ALERT: High severity GuardDuty findings detected in the last hour" \
+                --subject "Bookstore Security Alert"
+            fi
+          fi
+
+      - name: Check CloudTrail for Suspicious Activity
+        run: |
+          # Check for failed console logins in the last hour
+          FAILED_LOGINS=$(aws logs filter-log-events \
+            --log-group-name CloudTrail/BookstoreAuditLogs \
+            --start-time $(date -u -d '1 hour ago' +%s000) \
+            --filter-pattern '[timestamp, request_id, event_time, event_source="signin.amazonaws.com", event_name="ConsoleLogin", ., ., ., response_elements.ConsoleLogin="Failure"]' \
+            --query 'events[*].message' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ "$FAILED_LOGINS" != "" ]; then
+            FAILED_COUNT=$(echo "$FAILED_LOGINS" | wc -l)
+            if [ $FAILED_COUNT -gt 5 ]; then
+              aws sns publish \
+                --topic-arn arn:aws:sns:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:bookstore-alerts-${{ github.event.inputs.environment || 'dev' }} \
+                --message "🔒 SECURITY ALERT: Multiple failed console login attempts detected: $FAILED_COUNT attempts in the last hour" \
+                --subject "Bookstore Multiple Failed Login Alert"
+            fi
+          fi
